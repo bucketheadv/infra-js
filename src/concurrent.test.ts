@@ -2,8 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+    Hystrix,
     HystrixOpenError,
     HystrixTimeoutError,
+    Once,
+    Qps,
+    RateLimit,
     RateLimitError,
     RateLimitMode,
     warpHystrix,
@@ -123,6 +127,38 @@ test("对象参数即使 key 顺序不同也会命中同一个进行中请求", 
     assert.deepEqual(firstResult, secondResult);
 });
 
+test("Once 装饰器会复用同一实例方法的相同参数并发调用", async () => {
+    class ApiClient {
+        executionCount = 0;
+        deferred = createDeferred<string>();
+
+        @Once()
+        async fetch(value: string): Promise<{ value: string; result: string; executionCount: number }> {
+            this.executionCount += 1;
+            const result = await this.deferred.promise;
+
+            return { value, result, executionCount: this.executionCount };
+        }
+    }
+
+    const client = new ApiClient();
+    const firstPromise = client.fetch("api");
+    const secondPromise = client.fetch("api");
+
+    await Promise.resolve();
+    assert.equal(client.executionCount, 1);
+
+    client.deferred.resolve("ok");
+
+    const [firstResult, secondResult] = await Promise.all([
+        firstPromise,
+        secondPromise,
+    ]);
+
+    assert.deepEqual(firstResult, secondResult);
+    assert.equal(firstResult.executionCount, 1);
+});
+
 test("warpQps 默认使用 500 qps", async () => {
     let executionCount = 0;
     const wrapped = warpQps(async () => {
@@ -209,6 +245,60 @@ test("warpQps 使用 failFast 模式后，超出速率会直接抛错", async ()
     assert.equal(caughtError.mode, RateLimitMode.FailFast);
     assert.equal(caughtError.qps, 1);
     assert.ok(caughtError.waitMs > 0);
+});
+
+test("RateLimit 装饰器会对实例方法限流", async () => {
+    class ApiClient {
+        executionCount = 0;
+
+        @RateLimit({ qps: 1, mode: RateLimitMode.FailFast })
+        async fetch(value: string): Promise<string> {
+            this.executionCount += 1;
+            return value;
+        }
+    }
+
+    const client = new ApiClient();
+
+    assert.equal(await client.fetch("a"), "a");
+
+    let caughtError: unknown;
+    try {
+        await client.fetch("b");
+    } catch (error) {
+        caughtError = error;
+    }
+
+    assert.equal(client.executionCount, 1);
+    assert.ok(caughtError instanceof RateLimitError);
+    assert.equal(caughtError.mode, RateLimitMode.FailFast);
+});
+
+test("Qps 装饰器会对实例方法限流", async () => {
+    class ApiClient {
+        executionCount = 0;
+
+        @Qps({ qps: 1, mode: RateLimitMode.FailFast })
+        async fetch(value: string): Promise<string> {
+            this.executionCount += 1;
+            return value;
+        }
+    }
+
+    const client = new ApiClient();
+
+    assert.equal(await client.fetch("a"), "a");
+
+    let caughtError: unknown;
+    try {
+        await client.fetch("b");
+    } catch (error) {
+        caughtError = error;
+    }
+
+    assert.equal(client.executionCount, 1);
+    assert.ok(caughtError instanceof RateLimitError);
+    assert.equal(caughtError.mode, RateLimitMode.FailFast);
 });
 
 test("warpQps 使用 delay 模式后，超出速率会等待后执行", async () => {
@@ -342,4 +432,31 @@ test("warpHystrix 支持 fallback 降级结果", async () => {
 
     assert.equal(await wrapped("api"), "fallback:api");
     assert.equal(await wrapped("api"), "fallback:api");
+});
+
+test("Hystrix 装饰器会对实例方法熔断并保留 this", async () => {
+    class ApiClient {
+        executionCount = 0;
+
+        @Hystrix<[string], string>({
+            volumeThreshold: 1,
+            errorThresholdPercentage: 100,
+            sleepWindowMs: 50,
+            timeoutMs: 20,
+            fallback: async (error, value) => {
+                assert.match((error as Error).message, /failed:api|熔断器处于打开状态/);
+                return `fallback:${value}`;
+            },
+        })
+        async fetch(value: string): Promise<string> {
+            this.executionCount += 1;
+            throw new Error(`failed:${value}`);
+        }
+    }
+
+    const client = new ApiClient();
+
+    assert.equal(await client.fetch("api"), "fallback:api");
+    assert.equal(await client.fetch("api"), "fallback:api");
+    assert.equal(client.executionCount, 1);
 });

@@ -25,7 +25,7 @@ export class RateLimitError extends Error {
     }
 }
 
-type RateLimitOptions = {
+export type RateLimitOptions = {
     qps?: number;
     mode?: RateLimitMode;
 };
@@ -195,6 +195,59 @@ export function warpQps<Args extends unknown[], Result>(
     };
 }
 
+function wrapMethodPerReceiver(
+    descriptor: PropertyDescriptor,
+    wrapperFactory: (task: AsyncTask<unknown[], unknown>) => AsyncTask<unknown[], unknown>,
+): void {
+    if (!descriptor || typeof descriptor.value !== "function") {
+        throw new Error("装饰器只能用于方法");
+    }
+
+    const original = descriptor.value as (this: unknown, ...args: unknown[]) => unknown;
+    const receiverWrappers = new WeakMap<object, AsyncTask<unknown[], unknown>>();
+    let fallbackWrapper: AsyncTask<unknown[], unknown> | null = null;
+
+    function createWrapped(receiver: unknown): AsyncTask<unknown[], unknown> {
+        return wrapperFactory(async (...args: unknown[]) => original.apply(receiver, args));
+    }
+
+    function getWrapped(receiver: unknown): AsyncTask<unknown[], unknown> {
+        if ((typeof receiver === "object" && receiver !== null) || typeof receiver === "function") {
+            const cached = receiverWrappers.get(receiver);
+            if (cached) {
+                return cached;
+            }
+
+            const wrapped = createWrapped(receiver);
+            receiverWrappers.set(receiver, wrapped);
+            return wrapped;
+        }
+
+        fallbackWrapper ??= createWrapped(receiver);
+        return fallbackWrapper;
+    }
+
+    descriptor.value = function decoratedMethod(this: unknown, ...args: unknown[]) {
+        return getWrapped(this)(...args);
+    };
+}
+
+export function Once(): MethodDecorator {
+    return (_target, _propertyKey, descriptor) => {
+        wrapMethodPerReceiver(descriptor, (task) => warpOnce(task));
+    };
+}
+
+export function Qps(options: RateLimitOptions = {}): MethodDecorator {
+    return (_target, _propertyKey, descriptor) => {
+        wrapMethodPerReceiver(descriptor, (task) => warpQps(task, options));
+    };
+}
+
+export function RateLimit(options: RateLimitOptions = {}): MethodDecorator {
+    return Qps(options);
+}
+
 export function warpHystrix<Args extends unknown[], Result>(
     task: AsyncTask<Args, Result>,
     options: HystrixOptions<Args, Result> = {},
@@ -338,5 +391,15 @@ export function warpHystrix<Args extends unknown[], Result>(
                 halfOpenProbeInFlight = false;
             }
         }
+    };
+}
+
+export function Hystrix<Args extends unknown[] = unknown[], Result = unknown>(
+    options: HystrixOptions<Args, Result> = {},
+): MethodDecorator {
+    return (_target, _propertyKey, descriptor) => {
+        wrapMethodPerReceiver(descriptor, (task) =>
+            warpHystrix(task as AsyncTask<Args, Result>, options) as AsyncTask<unknown[], unknown>,
+        );
     };
 }

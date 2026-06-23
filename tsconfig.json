@@ -4,9 +4,10 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "types": ["node"],
-    "ignoreDeprecations": "6.0",
+    "ignoreDeprecations": "5.0",
     "rootDir": "src",
     "strict": true,
+    "experimentalDecorators": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
